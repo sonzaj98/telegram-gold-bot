@@ -1,38 +1,36 @@
+import logging
 import os
 import sqlite3
-import logging
-from io import StringIO
 from datetime import datetime
+from io import StringIO
 
 import pandas as pd
 import requests
-from dotenv import load_dotenv
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
 )
 
-load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_USER_ID = os.getenv("OWNER_USER_ID", "").strip()  # có thể để trống lúc đầu
+OWNER_USER_ID = os.getenv("OWNER_USER_ID", "").strip()
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+PORT = int(os.getenv("PORT", "10000"))
 
-DB_NAME = "gold_bot.db"
+DB_NAME = os.getenv("DB_NAME", "gold_bot.db")
 SJC_URL = "https://sjc.com.vn/gia-vang-online"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
+logger = logging.getLogger(__name__)
 
-# ====== Mapping loại vàng trong bot -> tên gần đúng trên bảng giá SJC ======
 GOLD_TYPE_MAP = {
     "sjc_mieng": [
         "Vàng SJC 1L, 10L, 1KG",
@@ -50,14 +48,14 @@ GOLD_TYPE_LABELS = {
     "sjc_nhan_9999": "Nhẫn SJC 9999",
 }
 
-# Conversation states
 BUY_DATE, QUANTITY, BUY_PRICE, GOLD_TYPE = range(4)
 
 
-def init_db():
+def init_db() -> None:
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             buy_date TEXT NOT NULL,
@@ -66,30 +64,27 @@ def init_db():
             gold_type TEXT NOT NULL,
             created_at TEXT NOT NULL
         )
-    """)
+        """
+    )
     conn.commit()
     conn.close()
 
 
-def get_conn():
+def get_conn() -> sqlite3.Connection:
     return sqlite3.connect(DB_NAME)
 
 
 def normalize_number(value):
-    """Chuyển '181,800,000' hoặc '181.800' thành float."""
     if value is None:
         return None
+
     s = str(value).strip()
     s = s.replace("₫", "").replace("đ", "").replace("VNĐ", "").strip()
     s = s.replace(" ", "")
 
-    # Nếu có dạng 181.800 -> khả năng là ngàn đồng
-    # Nếu có dạng 181,800,000 -> là đồng
     if s.count(".") > 0 and s.count(",") == 0:
-        # có thể là format 181.800 (nghìn đồng)
         try:
             num = float(s.replace(".", ""))
-            # giả định dữ liệu kiểu "181.800" nghìn đồng/lượng => 181,800,000 đồng/lượng
             return num * 1000
         except ValueError:
             return None
@@ -102,55 +97,34 @@ def normalize_number(value):
 
 
 def fetch_sjc_prices():
-    """
-    Trả về dict:
-    {
-        "sjc_mieng": {"buy_per_chi": ..., "sell_per_chi": ..., "matched_name": ...},
-        "sjc_nhan_9999": {...}
-    }
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
     resp = requests.get(SJC_URL, headers=headers, timeout=20)
     resp.raise_for_status()
 
-    html = resp.text
-    tables = pd.read_html(StringIO(html))
-
+    tables = pd.read_html(StringIO(resp.text))
     matched_rows = []
 
     for df in tables:
         if df.shape[1] < 3:
             continue
-
-        # Chuẩn hóa tên cột
         df.columns = [str(c).strip() for c in df.columns]
-        records = df.to_dict(orient="records")
-
-        for row in records:
+        for row in df.to_dict(orient="records"):
             vals = list(row.values())
             if len(vals) < 3:
                 continue
-
-            row_text = " | ".join(str(v) for v in vals if v is not None)
-            matched_rows.append(row_text)
+            matched_rows.append(" | ".join(str(v) for v in vals if v is not None))
 
     results = {}
-
     for internal_type, possible_names in GOLD_TYPE_MAP.items():
         found = None
-
         for row_text in matched_rows:
             for name in possible_names:
                 if name.lower() in row_text.lower():
                     parts = [p.strip() for p in row_text.split("|")]
-                    # thường là [Tên, Mua, Bán]
                     if len(parts) >= 3:
                         buy_val = normalize_number(parts[-2])
                         sell_val = normalize_number(parts[-1])
                         if buy_val and sell_val:
-                            # SJC niêm yết theo đồng/lượng => chia 10 ra đồng/chỉ
                             found = {
                                 "buy_per_chi": buy_val / 10,
                                 "sell_per_chi": sell_val / 10,
@@ -162,7 +136,6 @@ def fetch_sjc_prices():
 
         if not found:
             raise ValueError(f"Không tìm thấy giá hiện tại cho loại: {internal_type}")
-
         results[internal_type] = found
 
     return results
@@ -183,16 +156,15 @@ def format_date(date_str):
 def is_authorized(update: Update) -> bool:
     if not OWNER_USER_ID:
         return True
-    return str(update.effective_user.id) == OWNER_USER_ID
+    user = update.effective_user
+    return user is not None and str(user.id) == OWNER_USER_ID
 
 
 async def unauthorized(update: Update):
-    await update.message.reply_text(
-        "Bot này đang giới hạn cho chủ bot sử dụng."
-    )
+    message = update.effective_message
+    if message:
+        await message.reply_text("Bot này đang giới hạn cho chủ bot sử dụng.")
 
-
-# ================= COMMANDS =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -210,13 +182,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Đơn vị số lượng: chỉ\n"
         "Định giá hiện tại: dùng giá mua vào SJC."
     )
-    await update.message.reply_text(text)
+    await update.effective_message.reply_text(text)
 
 
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"Telegram user id của bạn là: {update.effective_user.id}\n"
-        "Hãy copy số này vào OWNER_USER_ID trong file .env nếu muốn khóa bot chỉ cho bạn dùng."
+        "Hãy copy số này vào OWNER_USER_ID trên Render nếu muốn khóa bot chỉ cho bạn dùng."
     )
 
 
@@ -233,9 +205,10 @@ async def gia(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"bán ra {format_vnd(v['sell_per_chi'])}/chỉ"
             )
         msg.append("\n*Tài sản hiện tại sẽ tính theo giá mua vào.*")
-        await update.message.reply_text("\n".join(msg))
+        await update.effective_message.reply_text("\n".join(msg), parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"Lỗi lấy giá vàng: {e}")
+        logger.exception("Lỗi lấy giá vàng")
+        await update.effective_message.reply_text(f"Lỗi lấy giá vàng: {e}")
 
 
 async def xem(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -244,26 +217,27 @@ async def xem(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         SELECT id, buy_date, quantity_chi, buy_price_per_chi, gold_type
         FROM transactions
         ORDER BY id DESC
-    """)
+        """
+    )
     rows = cur.fetchall()
     conn.close()
 
     if not rows:
-        return await update.message.reply_text("Chưa có giao dịch nào.")
+        return await update.effective_message.reply_text("Chưa có giao dịch nào.")
 
     lines = ["Danh sách giao dịch:"]
-    for row in rows:
-        tx_id, buy_date, quantity, buy_price, gold_type = row
+    for tx_id, buy_date, quantity, buy_price, gold_type in rows:
         lines.append(
             f"#{tx_id} | {format_date(buy_date)} | "
             f"{quantity:g} chỉ | {format_vnd(buy_price)}/chỉ | {GOLD_TYPE_LABELS.get(gold_type, gold_type)}"
         )
 
-    await update.message.reply_text("\n".join(lines))
+    await update.effective_message.reply_text("\n".join(lines))
 
 
 async def taisan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -272,23 +246,26 @@ async def taisan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         SELECT gold_type,
                SUM(quantity_chi) AS total_qty,
                SUM(quantity_chi * buy_price_per_chi) AS total_cost
         FROM transactions
         GROUP BY gold_type
-    """)
+        """
+    )
     rows = cur.fetchall()
     conn.close()
 
     if not rows:
-        return await update.message.reply_text("Chưa có giao dịch nào để tính tài sản.")
+        return await update.effective_message.reply_text("Chưa có giao dịch nào để tính tài sản.")
 
     try:
         prices = fetch_sjc_prices()
     except Exception as e:
-        return await update.message.reply_text(f"Không lấy được giá hiện tại: {e}")
+        logger.exception("Không lấy được giá hiện tại")
+        return await update.effective_message.reply_text(f"Không lấy được giá hiện tại: {e}")
 
     total_cost_all = 0
     total_market_all = 0
@@ -322,7 +299,7 @@ async def taisan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Tổng giá trị hiện tại: {format_vnd(total_market_all)}")
     lines.append(f"Tổng lãi/lỗ tạm tính: {format_vnd(total_pnl)}")
 
-    await update.message.reply_text("\n".join(lines))
+    await update.effective_message.reply_text("\n".join(lines))
 
 
 async def xoa(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -330,12 +307,12 @@ async def xoa(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await unauthorized(update)
 
     if not context.args:
-        return await update.message.reply_text("Cách dùng: /xoa <id>")
+        return await update.effective_message.reply_text("Cách dùng: /xoa <id>")
 
     try:
         tx_id = int(context.args[0])
     except ValueError:
-        return await update.message.reply_text("ID phải là số nguyên.")
+        return await update.effective_message.reply_text("ID phải là số nguyên.")
 
     conn = get_conn()
     cur = conn.cursor()
@@ -345,70 +322,66 @@ async def xoa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     if deleted:
-        await update.message.reply_text(f"Đã xóa giao dịch #{tx_id}.")
+        await update.effective_message.reply_text(f"Đã xóa giao dịch #{tx_id}.")
     else:
-        await update.message.reply_text(f"Không tìm thấy giao dịch #{tx_id}.")
+        await update.effective_message.reply_text(f"Không tìm thấy giao dịch #{tx_id}.")
 
-
-# ================= ADD TRANSACTION FLOW =================
 
 async def them_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return await unauthorized(update)
 
-    await update.message.reply_text("Nhập ngày mua theo dạng dd/mm/yyyy, ví dụ 15/03/2026")
+    await update.effective_message.reply_text("Nhập ngày mua theo dạng dd/mm/yyyy, ví dụ 15/03/2026")
     return BUY_DATE
 
 
 async def them_buy_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    text = update.effective_message.text.strip()
     try:
         datetime.strptime(text, "%d/%m/%Y")
     except ValueError:
-        await update.message.reply_text("Ngày không đúng định dạng. Hãy nhập dd/mm/yyyy")
+        await update.effective_message.reply_text("Ngày không đúng định dạng. Hãy nhập dd/mm/yyyy")
         return BUY_DATE
 
     context.user_data["buy_date"] = text
-    await update.message.reply_text("Nhập số lượng vàng (đơn vị chỉ), ví dụ 2.5")
+    await update.effective_message.reply_text("Nhập số lượng vàng (đơn vị chỉ), ví dụ 2.5")
     return QUANTITY
 
 
 async def them_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().replace(",", ".")
+    text = update.effective_message.text.strip().replace(",", ".")
     try:
         qty = float(text)
         if qty <= 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Số lượng không hợp lệ. Ví dụ: 1 hoặc 2.5")
+        await update.effective_message.reply_text("Số lượng không hợp lệ. Ví dụ: 1 hoặc 2.5")
         return QUANTITY
 
     context.user_data["quantity_chi"] = qty
-    await update.message.reply_text("Nhập giá mua tại thời điểm mua (đồng/chỉ), ví dụ 9200000")
+    await update.effective_message.reply_text("Nhập giá mua tại thời điểm mua (đồng/chỉ), ví dụ 9200000")
     return BUY_PRICE
 
 
 async def them_buy_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().replace(".", "").replace(",", "")
+    text = update.effective_message.text.strip().replace(".", "").replace(",", "")
     try:
         price = float(text)
         if price <= 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Giá mua không hợp lệ. Ví dụ: 9200000")
+        await update.effective_message.reply_text("Giá mua không hợp lệ. Ví dụ: 9200000")
         return BUY_PRICE
 
     context.user_data["buy_price_per_chi"] = price
 
-    keyboard = [
-        [
-            InlineKeyboardButton("SJC miếng", callback_data="sjc_mieng"),
-            InlineKeyboardButton("Nhẫn SJC 9999", callback_data="sjc_nhan_9999"),
-        ]
-    ]
-    await update.message.reply_text(
+    keyboard = [[
+        InlineKeyboardButton("SJC miếng", callback_data="sjc_mieng"),
+        InlineKeyboardButton("Nhẫn SJC 9999", callback_data="sjc_nhan_9999"),
+    ]]
+    await update.effective_message.reply_text(
         "Chọn loại vàng:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return GOLD_TYPE
 
@@ -422,16 +395,19 @@ async def them_gold_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         INSERT INTO transactions (buy_date, quantity_chi, buy_price_per_chi, gold_type, created_at)
         VALUES (?, ?, ?, ?, ?)
-    """, (
-        context.user_data["buy_date"],
-        context.user_data["quantity_chi"],
-        context.user_data["buy_price_per_chi"],
-        gold_type,
-        datetime.now().isoformat()
-    ))
+        """,
+        (
+            context.user_data["buy_date"],
+            context.user_data["quantity_chi"],
+            context.user_data["buy_price_per_chi"],
+            gold_type,
+            datetime.now().isoformat(),
+        ),
+    )
     conn.commit()
     tx_id = cur.lastrowid
     conn.close()
@@ -451,16 +427,11 @@ async def them_gold_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Đã hủy thao tác.")
+    await update.effective_message.reply_text("Đã hủy thao tác.")
     return ConversationHandler.END
 
 
-def main():
-    if not BOT_TOKEN:
-        raise ValueError("Bạn chưa điền BOT_TOKEN trong file .env")
-
-    init_db()
-
+def build_application():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
@@ -481,9 +452,27 @@ def main():
     app.add_handler(CommandHandler("taisan", taisan))
     app.add_handler(CommandHandler("xoa", xoa))
     app.add_handler(conv)
+    return app
 
-    print("Bot đang chạy...")
-    app.run_polling()
+
+def main():
+    if not BOT_TOKEN:
+        raise ValueError("Bạn chưa cấu hình BOT_TOKEN trên Render")
+    if not WEBHOOK_URL:
+        raise ValueError("Bạn chưa cấu hình WEBHOOK_URL trên Render")
+
+    init_db()
+    app = build_application()
+
+    webhook_path = f"/{BOT_TOKEN}"
+    logger.info("Bot đang chạy webhook tại cổng %s", PORT)
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_TOKEN,
+        webhook_url=f"{WEBHOOK_URL}{webhook_path}",
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
