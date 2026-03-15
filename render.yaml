@@ -1,0 +1,6 @@
+services:
+  - type: worker
+    name: gold-telegram-bot
+    runtime: python
+    buildCommand: ""
+    startCommand: python bot_gold.py
